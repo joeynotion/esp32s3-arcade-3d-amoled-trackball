@@ -1,292 +1,251 @@
-#include "input.h"
-#include "qspi_display.h"
-#include "trackball.h"
-#include "ui.h"
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
-#include <driver/gpio.h>
-#include <driver/rtc_io.h>
-#include <esp_heap_caps.h>
-#include <esp_sleep.h>
-#include <lvgl.h>
 
-// I2C Pins for trackball
-#define I2C_SDA 40
-#define I2C_SCL 39
+#include "TFT_eSPI.h"
+#include "drivers/trackball.h"
 
-// Buffer height for partial rendering (60 lines each)
-#define BUF_HEIGHT 60
+#include "colors.h"
+#include "config.h"
+#include "physics.h"
+#include "rendering.h"
+#include "structs.h"
+#include "track.h"
+#include "utils.h"
 
-// Power management settings
-#define IDLE_TIMEOUT_MS 10000 // 10 seconds
-#define FADE_OUT_STEP 8       // Brightness reduction per step
-#define FADE_IN_STEP 12       // Brightness increase per step
-#define FADE_OUT_INTERVAL_MS 20
-#define FADE_IN_INTERVAL_MS 10
-#define TARGET_BRIGHTNESS 200
+// Board trackball pins
+#define TRACKBALL_I2C_SDA 40
+#define TRACKBALL_I2C_SCL 39
 
-// Trackball instance (global, used by ui.cpp and input.cpp)
-Trackball trackball;
+int timeOfDay = 0; // 0=day, 1=sunset, 2=night
+long distSinceTimeChange = 0;
 
-// Global activity flag that input.cpp can set
-volatile bool g_activity_detected = false;
+static Trackball trackball;
+static float steerAccumulator = 0.0f;
+static uint32_t lastFrameUs = 0; // High precision timer
+static bool dayTransitionActive = false;
+static int dayFrom = 0;
+static int dayTo = 1;
+static float dayTransitionT = 0.0f;
+static bool gameStarted = false;
+static bool gamePaused = false;
 
-// Saved LED color for restoring after wake
-static uint8_t saved_led_r = 0;
-static uint8_t saved_led_g = 0;
-static uint8_t saved_led_b = 64; // Default blue
-static uint8_t saved_led_w = 0;
+// Trackball mount compensation:
+// rotate input vector 90 degrees to match physical orientation.
+static constexpr bool TRACKBALL_ROTATE_90 = true;
+static constexpr bool TRACKBALL_ROTATE_CW = true;
+static constexpr int TRACKBALL_STEER_SIGN = -1;
 
-/* Display flushing callback for LVGL 9 */
-void disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-  uint32_t w = lv_area_get_width(area);
-  uint32_t h = lv_area_get_height(area);
-
-  lcd.setWindow(area->x1, area->y1, w, h);
-  lcd.pushPixels((uint16_t *)px_map, w * h);
-
-  lv_display_flush_ready(disp);
-}
+static constexpr float DAY_TRANSITION_SECONDS = 4.0f;
+static constexpr int TIME_CHANGE_DISTANCE = 180000;
 
 void setup() {
   Serial.begin(115200);
-  delay(2000); // Wait for Serial Monitor to connect
-  Serial.println("Starting...");
 
-  // Init I2C for trackball
-  Wire.begin(I2C_SDA, I2C_SCL);
-
-  // Init Display
-  if (!lcd.begin()) {
-    Serial.println("Display init failed!");
-    while (1)
-      delay(100);
+  randomSeed((uint32_t)micros());
+  Wire.begin(TRACKBALL_I2C_SDA, TRACKBALL_I2C_SCL);
+  if (trackball.begin(Wire)) {
+    trackball.setRGBW(0, 40, 120, 0);
   }
 
-  // Init Trackball
-  if (!trackball.begin(Wire)) {
-    Serial.println("Trackball not found!");
-  } else {
-    trackball.setRGBW(0, 0, 64, 0); // Start with dim blue
-    Serial.println("Trackball ready");
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  spr.setColorDepth(16);
+  spr.setAttribute(PSRAM_ENABLE, true);
+  if (spr.createSprite(SCR_W, SCR_H) == nullptr) {
+    Serial.println("ERROR: sprite allocation failed");
   }
 
-  // Init LVGL
-  lv_init();
+  initPhysics();
 
-  // Register tick callback
-  lv_tick_set_cb([]() -> uint32_t { return millis(); });
+  Serial.print("Total PSRAM: ");
+  Serial.println(ESP.getPsramSize());
+  Serial.print("Free PSRAM:  ");
+  Serial.println(ESP.getFreePsram());
 
-  // Create display with LVGL 9 API
-  lv_display_t *disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
-
-  // Allocate double buffers in PSRAM for smooth rendering
-  size_t buf_size = LCD_WIDTH * BUF_HEIGHT * sizeof(lv_color_t);
-  uint8_t *buf1 = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-  uint8_t *buf2 = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-
-  if (!buf1 || !buf2) {
-    Serial.println("PSRAM buffer alloc failed, using internal RAM");
-    static uint8_t fallback_buf[LCD_WIDTH * 20 * sizeof(lv_color_t)];
-    lv_display_set_buffers(disp, fallback_buf, NULL, sizeof(fallback_buf),
-                           LV_DISPLAY_RENDER_MODE_PARTIAL);
-  } else {
-    lv_display_set_buffers(disp, buf1, buf2, buf_size,
-                           LV_DISPLAY_RENDER_MODE_PARTIAL);
-    Serial.printf("PSRAM buffers allocated: %d bytes each\n", buf_size);
+  initColors(timeOfDay);
+  initBackground();
+  buildTrack();
+  initTraffic(maxSpeed);
+  Serial.println("=== TRAFFIC INIT ===");
+  for (int i = 0; i < MAX_CARS; i++) {
+    Serial.printf("Car %d: z=%.0f offset=%.2f speed=%.0f color=0x%04X\n", i,
+                  trafficCars[i].z, trafficCars[i].offset, trafficCars[i].speed,
+                  trafficCars[i].color);
   }
 
-  lv_display_set_flush_cb(disp, disp_flush);
-
-  // Create keypad input device with LVGL 9 API
-  lv_indev_t *indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_KEYPAD);
-  lv_indev_set_read_cb(indev, keypad_read);
-  lv_indev_set_display(indev, disp);
-
-  // Set faster polling rate for better responsiveness
-  lv_timer_set_period(lv_indev_get_read_timer(indev), 20);
-
-  // Build UI
-  ui_init();
-
-  Serial.println("Setup complete");
-}
-
-enum power_state_t {
-  STATE_AWAKE,
-  STATE_FADING_OUT,
-  STATE_LIGHT_SLEEP,
-  STATE_FADING_IN
-};
-
-static power_state_t power_state = STATE_AWAKE;
-static uint8_t cur_brightness = TARGET_BRIGHTNESS;
-static uint32_t last_brightness_update = 0;
-static uint32_t last_activity_time = 0;
-
-void enter_light_sleep() {
-  Serial.println("Entering light sleep mode...");
-
-  // Turn off trackball LED completely
-  trackball.setRGBW(0, 0, 0, 0);
-
-  // Put display in sleep mode
-  lcd.setSleep(true);
-
-  // Light sleep with polling: sleep in short bursts and check for activity
-  // This is more reliable than GPIO interrupt for I2C devices
-  while (power_state == STATE_LIGHT_SLEEP) {
-    // Sleep for 100ms at a time
-    esp_sleep_enable_timer_wakeup(100 * 1000ULL); // 100ms in microseconds
-    esp_light_sleep_start();
-
-    // Check for trackball activity after each wake
-    trackball.update();
-
-    // Check for any movement or button press
-    if (trackball.right() != 0 || trackball.left() != 0 ||
-        trackball.up() != 0 || trackball.down() != 0 || trackball.isPressed() ||
-        trackball.clicked()) {
-
-      Serial.println("Trackball activity detected, waking display!");
-
-      // Wake display FIRST
-      lcd.setSleep(false);
-      Serial.println("Display sleep disabled");
-
-      // Reinitialize I2C to ensure reliability
-      Wire.begin(I2C_SDA, I2C_SCL);
-
-      // Reinitialize Serial to restore USB CDC communication
-      Serial.begin(115200);
-      delay(50); // Small delay for USB re-enumeration/sync
-
-      // Restore trackball LED to saved color
-      trackball.setRGBW(saved_led_r, saved_led_g, saved_led_b, saved_led_w);
-      Serial.printf("LED restored: R=%d G=%d B=%d W=%d\n", saved_led_r,
-                    saved_led_g, saved_led_b, saved_led_w);
-
-      // Clear any pending trackball data
-      trackball.update();
-
-      // Set brightness to 0 to start fade-in from black
-      cur_brightness = 0;
-      lcd.setBrightness(cur_brightness);
-      Serial.println("Brightness reset to 0 for fade-in");
-
-      // Force full screen refresh
-      lv_obj_invalidate(lv_screen_active());
-      Serial.println("Screen invalidated");
-
-      // Set activity flag and update timestamp
-      g_activity_detected = true;
-      last_activity_time = millis();
-      last_brightness_update = millis();
-
-      // Change to fading in state
-      power_state = STATE_FADING_IN;
-      Serial.println("State changed to FADING_IN");
-
-      break; // Exit sleep loop
+  while (true) {
+    float animTime = millis() * 0.001f;
+    drawStartScreen(animTime);
+    if (trackball.update() && trackball.clicked()) {
+      break;
     }
+    delay(16);
   }
 
-  Serial.println("Exited light sleep");
-}
+  lastFrameUs = micros();
+  distSinceTimeChange = 0;
+  dayTransitionActive = false;
+  dayFrom = timeOfDay;
+  dayTo = (timeOfDay + 1) % 3;
+  dayTransitionT = 0.0f;
+  gameStarted = true;
+  gamePaused = false;
 
-void handle_power_save() {
-  uint32_t now = millis();
-
-  // Check for activity flag set by input handler
-  if (g_activity_detected) {
-    last_activity_time = now;
-    g_activity_detected = false;
-
-    // If in light sleep, wake-up is handled in enter_light_sleep() after
-    // esp_light_sleep_start() This handles activity during fade states
-    if (power_state == STATE_FADING_OUT) {
-      Serial.println("Activity during fade-out, reversing...");
-      power_state = STATE_FADING_IN;
-      last_brightness_update = now;
-    } else if (power_state == STATE_LIGHT_SLEEP) {
-      // Just came back from light sleep, start fading in
-      power_state = STATE_FADING_IN;
-      last_brightness_update = now;
-    }
-  }
-
-  uint32_t idle_time = now - last_activity_time;
-
-  switch (power_state) {
-  case STATE_AWAKE:
-    if (idle_time > IDLE_TIMEOUT_MS) {
-      power_state = STATE_FADING_OUT;
-      last_brightness_update = now;
-      Serial.println("Idle timeout, fading out...");
-    }
-    break;
-
-  case STATE_FADING_OUT:
-    if (now - last_brightness_update > FADE_OUT_INTERVAL_MS) {
-      if (cur_brightness > 0) {
-        int next_b = (int)cur_brightness - FADE_OUT_STEP;
-        cur_brightness = (next_b < 0) ? 0 : next_b;
-        lcd.setBrightness(cur_brightness);
-      } else {
-        power_state = STATE_LIGHT_SLEEP;
-        enter_light_sleep(); // Blocks until wake
-        // After wake, state will be changed to FADING_IN by activity detection
-      }
-      last_brightness_update = now;
-    }
-    break;
-
-  case STATE_LIGHT_SLEEP:
-    // This state should not be reached in normal flow
-    // Wake-up is handled inside enter_light_sleep()
-    Serial.println("WARNING: STATE_LIGHT_SLEEP reached in state machine");
-    power_state = STATE_FADING_IN;
-    break;
-
-  case STATE_FADING_IN:
-    if (now - last_brightness_update > FADE_IN_INTERVAL_MS) {
-      if (cur_brightness < TARGET_BRIGHTNESS) {
-        int next_b = (int)cur_brightness + FADE_IN_STEP;
-        cur_brightness =
-            (next_b > TARGET_BRIGHTNESS) ? TARGET_BRIGHTNESS : next_b;
-        lcd.setBrightness(cur_brightness);
-        if (cur_brightness % 48 == 0) {
-          Serial.printf("Fading in... brightness=%d\n", cur_brightness);
-        }
-      } else {
-        power_state = STATE_AWAKE;
-        Serial.println("Display fully awake");
-      }
-      last_brightness_update = now;
-    }
-    break;
-  }
-}
-
-// Function to save current LED color (call from ui.cpp button handler)
-void set_trackball_led_color(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-  saved_led_r = r;
-  saved_led_g = g;
-  saved_led_b = b;
-  saved_led_w = w;
-  trackball.setRGBW(r, g, b, w);
+  // Flush any pending movement from startup interaction.
+  trackball.update();
+  steerAccumulator = 0.0f;
+  manualSteerInput = 0.0f;
 }
 
 void loop() {
-  // Update trackball ONCE per loop iteration
-  trackball.update();
+  uint32_t nowUs = micros();
+  float dt = (float)(nowUs - lastFrameUs) / 1000000.0f;
+  lastFrameUs = nowUs;
 
-  // Handle LVGL timers (which will call keypad_read)
-  lv_timer_handler();
+  // Stability clamp
+  if (dt <= 0.0f)
+    dt = 0.001f;
+  if (dt > 0.1f)
+    dt = 0.1f;
 
-  // Handle power management
-  handle_power_save();
+  bool trackballOk = trackball.update();
+  bool buttonClicked = trackballOk && trackball.clicked();
+  int16_t raw_dx = 0;
+  if (trackballOk) {
+    int16_t axisX = trackball.right() - trackball.left();
+    int16_t axisY = trackball.down() - trackball.up();
 
-  delay(5);
+    if (TRACKBALL_ROTATE_90) {
+      axisX = TRACKBALL_ROTATE_CW ? axisY : -axisY;
+    }
+    raw_dx = axisX * TRACKBALL_STEER_SIGN;
+  }
+
+  if (!gameStarted) {
+    float animTime = millis() * 0.001f;
+    drawStartScreen(animTime);
+    if ((millis() / 400) % 2 == 0) {
+      spr.setTextSize(1);
+      spr.setTextColor(TFT_CYAN);
+      spr.setCursor(SCR_CX - 73, 206);
+      spr.print("PRESS TRACKBALL TO START");
+      spr.pushSprite(0, 0);
+    }
+    if (buttonClicked) {
+      gameStarted = true;
+      gamePaused = false;
+      steerAccumulator = 0.0f;
+      manualSteerInput = 0.0f;
+      lastFrameUs = micros();
+    }
+    delay(16);
+    return;
+  }
+
+  if (buttonClicked) {
+    gamePaused = !gamePaused;
+    steerAccumulator = 0.0f;
+    manualSteerInput = 0.0f;
+    lastFrameUs = nowUs;
+  }
+
+  if (gamePaused) {
+    drawSky(position, playerZdist, timeOfDay, skyOffset);
+    drawRoad(position, playerX, playerZdist, cameraDepth, timeOfDay);
+    drawPlayerCar();
+    drawHUD(speed, maxSpeed, currentLapTime, bestLapTime);
+    spr.fillRect(SCR_CX - 90, SCR_CY - 24, 180, 48, TFT_BLACK);
+    spr.drawRect(SCR_CX - 91, SCR_CY - 25, 182, 50, TFT_YELLOW);
+    spr.setTextSize(2);
+    spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+    spr.setCursor(SCR_CX - 36, SCR_CY - 16);
+    spr.print("PAUSED");
+    spr.setTextSize(1);
+    spr.setCursor(SCR_CX - 68, SCR_CY + 7);
+    spr.print("Click trackball to resume");
+    spr.pushSprite(0, 0);
+    delay(16);
+    return;
+  }
+
+  if (raw_dx >= -1 && raw_dx <= 1) {
+    raw_dx = 0;
+  }
+
+  // Trackball sensitivity/response tuned for faster recentering.
+  float targetSteer = clampF(raw_dx * 0.42f, -1.0f, 1.0f);
+  steerAccumulator = steerAccumulator * 0.30f + targetSteer * 0.70f;
+  if (!trackballOk) {
+    steerAccumulator *= 0.85f;
+  }
+
+  // Click recenters steering quickly.
+  if (trackball.clicked() || trackball.isPressed()) {
+    steerAccumulator *= 0.45f;
+  }
+  if (steerAccumulator > -0.02f && steerAccumulator < 0.02f) {
+    steerAccumulator = 0.0f;
+  }
+  manualSteerInput = steerAccumulator;
+
+  if (!crashed) {
+    handleInput(dt);
+  }
+
+  // updatePhysics now handles its own internal "crashed" early return for
+  // player logic, while still updating traffic regardless.
+  updatePhysics(dt);
+
+  if (!crashed) {
+    checkCollisions();
+
+    int pSeg = findSegIdx(position + playerZdist);
+    float curveForce = segments[pSeg].curve;
+    skyOffset += curveForce * (speed / maxSpeed) * 150.0f * dt;
+  }
+
+  drawSky(position, playerZdist, timeOfDay, skyOffset);
+  drawRoad(position, playerX, playerZdist, cameraDepth, timeOfDay);
+  drawPlayerCar();
+  drawHUD(speed, maxSpeed, currentLapTime, bestLapTime);
+
+  if (crashed) {
+    drawCrashMessage();
+    if (millis() - crashTimer > 2000) {
+      crashed = false;
+      speed = 0;
+      playerX = 0;
+    }
+  }
+
+  spr.pushSprite(0, 0);
+  delay(2); // Cap frame rate to ~500fps for physics stability
+
+  distSinceTimeChange += (int)(speed * dt);
+  if (!dayTransitionActive && distSinceTimeChange > TIME_CHANGE_DISTANCE) {
+    distSinceTimeChange = 0;
+    dayTransitionActive = true;
+    dayFrom = timeOfDay;
+    dayTo = (timeOfDay + 1) % 3;
+    dayTransitionT = 0.0f;
+  }
+
+  if (dayTransitionActive) {
+    dayTransitionT += dt / DAY_TRANSITION_SECONDS;
+    float t = dayTransitionT;
+    if (t > 1.0f) {
+      t = 1.0f;
+    }
+    // Smooth cosine easing avoids visible snapping.
+    float eased = -cosf(t * PI) * 0.5f + 0.5f;
+    blendColors(dayFrom, dayTo, eased);
+    if (dayTransitionT >= 1.0f) {
+      dayTransitionActive = false;
+      timeOfDay = dayTo;
+      initColors(timeOfDay);
+    }
+  }
 }

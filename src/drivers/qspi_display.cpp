@@ -204,8 +204,12 @@ void QSPI_Display::pushPixels(uint16_t *data, uint32_t len) {
     uint32_t chunk =
         (remaining > QSPI_MAX_PIXELS) ? QSPI_MAX_PIXELS : remaining;
 
-    // Copy pixel data directly (no byte swap needed with BGR mode)
-    memcpy(_buffer, src, chunk * 2);
+    // Swap high/low bytes for 16-bit QSPI data
+    uint16_t *dst = (uint16_t *)_buffer;
+    for (uint32_t i = 0; i < chunk; i++) {
+      uint16_t v = src[i];
+      dst[i] = (v >> 8) | (v << 8);
+    }
 
     if (first) {
       _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO;
@@ -240,3 +244,43 @@ void QSPI_Display::pollStart() {
 }
 
 void QSPI_Display::pollEnd() { spi_device_polling_end(_handle, portMAX_DELAY); }
+
+void QSPI_Display::pushColor(uint16_t color, uint32_t len) {
+  CS_LOW();
+
+  bool first = true;
+  uint32_t remaining = len;
+
+  while (remaining > 0) {
+    uint32_t chunk =
+        (remaining > QSPI_MAX_PIXELS) ? QSPI_MAX_PIXELS : remaining;
+
+    // Swap bytes for color fill
+    uint16_t swapped = (color >> 8) | (color << 8);
+    uint16_t *dst = (uint16_t *)_buffer;
+    for (uint32_t i = 0; i < chunk; i++) {
+      dst[i] = swapped;
+    }
+
+    if (first) {
+      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO;
+      _spi_tran_ext.base.cmd = 0x32;
+      _spi_tran_ext.base.addr = 0x003C00;
+      first = false;
+    } else {
+      _spi_tran_ext.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                                 SPI_TRANS_VARIABLE_ADDR |
+                                 SPI_TRANS_VARIABLE_DUMMY;
+    }
+
+    _spi_tran_ext.base.tx_buffer = _buffer;
+    _spi_tran_ext.base.length = chunk << 4;
+
+    pollStart();
+    pollEnd();
+
+    remaining -= chunk;
+  }
+
+  CS_HIGH();
+}

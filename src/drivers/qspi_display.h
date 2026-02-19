@@ -17,7 +17,7 @@
 #define LCD_HEIGHT 240
 
 // QSPI Settings
-#define QSPI_FREQUENCY 80000000
+#define QSPI_FREQUENCY 40000000
 #define QSPI_MAX_PIXELS 8192
 
 class QSPI_Display {
