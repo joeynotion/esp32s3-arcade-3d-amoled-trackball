@@ -113,10 +113,3 @@ src/
 | `FOG_DENSITY` | `8` | Distance fog intensity |
 | `DRAW_DIST` | `40` | Number of projected road segments |
 | `ROAD_W` | `2000` | World road width scalar |
-
----
-
-## Notes
-
-- The `reference/` directory is preserved for cross-checking against the original implementation.
-- This fork is authored for AMOLED + trackball hardware first; behavior will differ from the original button/ILI9341 target.
