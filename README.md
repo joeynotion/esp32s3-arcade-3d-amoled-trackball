@@ -1,178 +1,122 @@
-# ESP32-S3-AMOLED Platform
+# ESP32 Pseudo-3D Racing Game (AMOLED + Trackball Fork)
 
-![PlatformIO](https://img.shields.io/badge/Platform-PlatformIO-orange)
-![ESP32](https://img.shields.io/badge/Chip-ESP32--S3-32cd32)
-![Display](https://img.shields.io/badge/Display-AMOLED_1.91%22-blue)
-![LVGL](https://img.shields.io/badge/GUI-LVGL_9-red)
-
-A reference implementation for the **Waveshare ESP32-S3-AMOLED-1.91** development board integrated with the **Pimoroni Trackball Breakout**. This project standardizes the drivers, power management, and UI architecture to serve as a foundation for future derived systems.
+This repository is a hardware-adapted fork of
+[`davidmonterocrespo24/esp32s3-arcade-3d`](https://github.com/davidmonterocrespo24/esp32s3-arcade-3d),
+ported to a widescreen AMOLED setup with trackball input.
 
 ---
 
-## ✨ Features
+## Features
 
-*   **Low Power Mode**: Polled `esp_light_sleep` implementation for low idle consumption with instant wake-on-input.
-*   **Graphics**: Dual-buffered **LVGL 9** rendering on the RM67162 AMOLED controller using OPI PSRAM.
-*   **Input Handling**: Support for **RGBW LED** control and unified I2C bus driver with coordinate rotation.
-*   **Build Configuration**: Verified partition tables and build scripts to address common Xtensa/ARM assembly conflicts.
-*   **Embedded Drivers**: Custom implementations for the QSPI display and I2C trackball to support specific power states and peripheral configurations.
-
-## 🎮 About the Demo
-
-This project compiles into a complete interactive reference application that demonstrates:
-
-1.  **Smooth UI**: A responsive LVGL interface running on the AMOLED screen.
-2.  **Trackball Navigation**: Use the trackball to move focus between UI elements (rotated 90° to match the screen).
-3.  **Smart Power Saving**:
-    *   Uses a 4-state machine: `AWAKE` -> `FADE_OUT` -> `LIGHT_SLEEP` -> `FADE_IN`.
-    *   **Idle**: Dimming after 10s of inactivity, then entering Light Sleep.
-    *   **Sleep**: Display & LED off. Polled wake-up every 100ms (Light Sleep).
-    *   **Wake**: Instant wake-up by rolling or clicking the trackball.
-4.  **Feedback**: Click the on-screen color buttons to set the trackball's RGBW LED to the corresponding color.
+- Pseudo-3D road rendering with segment-based back-to-front drawing
+- 3D player car with textured mesh rendering
+- Traffic system with 6 AI vehicles
+- Procedural track generation: curves, hills, tunnel, roadside scenery, buildings
+- Day / sunset / night cycle with eased transitions
+- Atmospheric distance fog and skyline parallax
+- Automatic acceleration with speed-aware steering assist
+- HUD with speedometer calibrated to 250 km/h top speed
+- Trackball-driven steering, press-to-start splash, and press-to-pause
 
 ---
 
-## 🚀 Getting Started
+## Fork-Specific Changes
+
+- Display target changed to 536x240 AMOLED (landscape)
+- Input changed from button steering to Pimoroni trackball over I2C
+- Trackball axis rotation and sign compensation added for physical mounting
+- Rival vehicle rendering tuned for AMOLED composition
+- Startup flow changed to wait on trackball click
+- Pause/resume bound to trackball click while in-game
+- Night stars masked behind skyline parallax layer
+
+---
+
+## Hardware
+
+| Component | Details |
+| --------- | ------- |
+| MCU | ESP32-S3 (240 MHz dual-core) |
+| Display | 1.91 inch AMOLED, 536x240, RGB565 |
+| Input | Pimoroni Trackball Breakout (I2C) |
+| I2C Pins | SDA = GPIO40, SCL = GPIO39 |
+| PSRAM/Flash | 8 MB PSRAM, 16 MB Flash |
+
+---
+
+## Controls
+
+| Action | Hardware |
+| ------ | -------- |
+| Steer | Roll trackball left/right |
+| Start game | Click trackball on splash |
+| Pause / Resume | Click trackball in-game |
+| Throttle | Automatic |
+
+---
+
+## Build and Flash (PlatformIO)
 
 ### Prerequisites
-*   **VSCode** with **PlatformIO** extension.
-*   **Python 3** (for build scripts).
 
-### Installation
-1.  **Clone the repository**
-2.  **Verify `platformio.ini`**: Ensure `board_build.arduino.memory_type = qio_opi` is set.
-3.  **Build & Flash**: Connect via USB-C (ensure you hold BOOT if it's the first flash).
+- VS Code with PlatformIO extension, or PlatformIO Core CLI
 
----
+### Default environment
 
-## 🛠️ Hardware Specification
+- `waveshare_amoled`
 
-| Component | Detail |
-| :--- | :--- |
-| **MCU** | ESP32-S3R8 (Dual Core 240MHz) |
-| **PSRAM** | 8MB OPI (Octal SPI) |
-| **Flash** | 16MB (External) |
-| **Display** | 1.91" AMOLED (240x536) @ 60Hz |
-| **IMU** | QMI8658 (6-Axis) |
-| **Input** | Pimoroni Trackball Breakout (RGBW LED, Nuvoton MCU) |
+### Commands
 
----
-
-## 🔌 Pinout Reference
-
-| Function | Pin (GPIO) | Notes |
-| :--- | :--- | :--- |
-| **QSPI SCK** | 47 | Shared with SD Card CLK |
-| **QSPI CS** | 6 | Display Chip Select |
-| **I2C SDA** | 40 | Trackball & IMU Shared |
-| **I2C SCL** | 39 | Trackball & IMU Shared |
-| **Display RST** | - | Internal/Shared |
-| **Battery ADC** | 1 | Voltage Monitor |
-
----
-
-## 🧠 System Architecture
-
-### 1. Display (RM67162)
-Driven via **QSPI** at 40MHz. Requires specific initialization for the AMOLED panel:
-*   **Color Inversion**: `INVON (0x21)` is **mandatory** for correct black levels.
-*   **Orientation**: `MADCTL (0x36)` set to `0x20 | 0x80` for landscape.
-*   **Buffering**: Uses two `MALLOC_CAP_SPIRAM` buffers in PSRAM for smooth partial rendering.
-
-### 2. Power Management
-Uses a **Polled Light Sleep** loop:
-1.  Enter `esp_light_sleep_start()` for 100ms.
-2.  Wake & Poll Trackball I2C.
-3.  If no activity -> Sleep.
-4.  If activity -> Wake Display -> `lv_obj_invalidate()` -> Fade In.
-
-### 3. Memory Layout
-*   **App Partition**: 3MB (via `partitions.csv`)
-*   **Filesystem**: ~9.9MB FATFS/LittleFS
-*   **PSRAM**: 8MB OPI (Critical: `qio_opi` mode)
-
----
-
-## 🏗️ Technical Implementations
-
-The project uses custom-built drivers located in `src/` to handle specific hardware requirements:
-
-1.  **RM67162 AMOLED Driver** (`qspi_display.cpp/h`):
-    *   Configures the ESP32-S3 **QSPI** peripheral at 40MHz.
-    *   Uses manual memory-mapped addressing for frame data transfers.
-    *   Implements the hardware-level sleep/wake commands for the display controller.
-2.  **Pimoroni Trackball Driver** (`trackball.h`):
-    *   Header-only I2C implementation for the Nuvoton-based breakout.
-    *   Supports **RGBW** LED control and directional polling.
-3.  **LVGL Input Bridge** (`input.cpp/h`):
-    *   Maps the physical trackball to the LVGL `KEYPAD` input system.
-    *   Implements coordinate rotation and software debouncing.
-
----
-
-## 🐛 Troubleshooting & Tips
-
-*   **Display is Negative?** -> You missed the `INVON (0x21)` command in init.
-*   **Build Error (Neon/Helium)?** -> Run the `fix_lvgl_9.py` script to remove ARM assembly.
-*   **No Serial Output?** -> Set `ARDUINO_USB_CDC_ON_BOOT=1` in `platformio.ini`.
-*   **Serial Stops after Sleep?** -> This is normal behavior. It automatically reconnects 50ms after wake.
-*   **Input Lag?** -> Check `NAVIGATION_THRESHOLD` in `input.cpp`.
-
----
-
-## 📚 Appendices
-
-### A. Partition Table (`partitions.csv`)
-```csv
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x5000,
-otadata,  data, ota,     0xe000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x300000,
-app1,     app,  ota_1,   0x310000,0x300000,
-spiffs,   data, spiffs,  0x610000, 0x9E0000,
+```bash
+pio run
+pio run -t upload
+pio device monitor -b 115200
 ```
 
-### B. Display Init Sequence (`qspi_display.cpp`)
-```cpp
-// 1. SlpOut & Wait
-writeCommand(0x11); delay(120);
-// 2. Color Mode 16-bit
-writeC8D8(0x3A, 0x55); 
-// 3. Orientation
-writeC8D8(0x36, 0x20 | 0x80 | 0x00); 
-// 4. Brightness
-writeC8D8(0x51, 0x00); 
-// 5. Display ON
-writeCommand(0x29); 
-// 6. Color Inversion (CRITICAL)
-writeCommand(0x21); delay(20);
+If upload fails on first flash, hold BOOT while connecting/resetting.
+
+---
+
+## Project Structure
+
+```text
+src/
+|-- main.cpp                # Main loop, startup/pause flow, trackball mapping
+|-- config.h                # Tunable gameplay and projection constants
+|-- physics.cpp/.h          # Speed, steering assist, gravity, collisions
+|-- track.cpp/.h            # Procedural track and traffic initialization
+|-- rendering.cpp/.h        # Shared render state, parallax background
+|-- render_road.cpp/.h      # Road bands, tunnel, scenery, traffic placement
+|-- render_player.cpp/.h    # Player car mesh rendering + splash/crash overlays
+|-- render_traffic.cpp/.h   # Rival car geometry rendering
+|-- render_building.cpp/.h  # Roadside building rendering
+|-- render_hud.cpp/.h       # Speedometer and lap HUD
+|-- colors.cpp/.h           # Day/sunset/night palettes and blending
+|-- utils.cpp/.h            # Math helpers
+|-- drivers/
+|   |-- qspi_display.cpp/.h # AMOLED display driver path used by TFT wrapper
+|   `-- trackball.h         # Trackball I2C + click state
+|-- TFT_eSPI.cpp/.h         # Local display wrapper used by this fork
+|-- car2_mesh.h             # Car mesh asset
+`-- car2_texture.h          # Car texture asset
 ```
 
-### C. Build Patch (`fix_lvgl_9.py`)
-```python
-# Removes ARM assembly from LVGL which breaks ESP32 builds
-import os
-import shutil
-Import("env")
+---
 
-try:
-    # Get the library dependencies directory
-    libdeps_dir = env.subst("$PROJECT_LIBDEPS_DIR")
-    env_name = env.subst("$PIOENV")
-    lvgl_dir = os.path.join(libdeps_dir, env_name, "lvgl")
+## Key Constants (`src/config.h`)
 
-    if os.path.exists(lvgl_dir):
-        problematic_dirs = [
-            os.path.join(lvgl_dir, "src", "draw", "sw", "blend", "helium"),
-            os.path.join(lvgl_dir, "src", "draw", "sw", "blend", "neon"),
-            os.path.join(lvgl_dir, "src", "draw", "convert", "helium"),
-            os.path.join(lvgl_dir, "src", "draw", "convert", "neon"),
-        ]
-        
-        for d in problematic_dirs:
-            if os.path.exists(d):
-                print(f"Removing problematic LVGL 9 directory: {d}")
-                shutil.rmtree(d)
-except Exception as e:
-    print(f"Error in fix_lvgl_9.py: {e}")
-```
+| Constant | Value | Description |
+| -------- | ----- | ----------- |
+| `SCR_W` / `SCR_H` | `536 / 240` | AMOLED framebuffer size |
+| `TOP_SPEED_KMH` | `250.0f` | HUD top speed calibration |
+| `SPEED_MULTIPLIER` | `62.0f` | Physics speed cap scalar |
+| `FOG_DENSITY` | `8` | Distance fog intensity |
+| `DRAW_DIST` | `40` | Number of projected road segments |
+| `ROAD_W` | `2000` | World road width scalar |
+
+---
+
+## Notes
+
+- The `reference/` directory is preserved for cross-checking against the original implementation.
+- This fork is authored for AMOLED + trackball hardware first; behavior will differ from the original button/ILI9341 target.
