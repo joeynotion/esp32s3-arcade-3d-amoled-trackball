@@ -10,7 +10,7 @@ extern float maxSpeed;
 extern float centrifugal;
 extern bool crashed;
 extern unsigned long crashTimer;
-extern unsigned long lastFrameMs;
+
 extern float currentLapTime;
 extern float lastLapTime;
 extern float bestLapTime;
@@ -29,4 +29,3 @@ void updatePhysics(float dt);
 void checkCollisions();
 
 #endif
-

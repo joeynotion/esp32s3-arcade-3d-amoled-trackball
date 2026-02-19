@@ -16,7 +16,6 @@ float centrifugal = CENTRIFUGAL;
 
 bool crashed = false;
 unsigned long crashTimer = 0;
-unsigned long lastFrameMs;
 
 float currentLapTime = 0;
 float lastLapTime = 0;
@@ -35,7 +34,8 @@ static constexpr float LAUNCH_ACCEL_PCT = 0.14f;
 static constexpr float LOW_SPEED_GRAVITY_ATTEN = 0.18f;
 static constexpr float AUTO_STEER_TARGET_SCALE = 0.12f; // Reference behavior.
 static constexpr float AUTO_STEER_BLEND = 0.55f;        // Keep assist gentle.
-static constexpr float AUTO_STEER_CURVE_BOOST = 0.55f;  // Extra assist on hard turns.
+static constexpr float AUTO_STEER_CURVE_BOOST =
+    0.55f; // Extra assist on hard turns.
 
 void initPhysics() {
   float fovRad = FOV_DEG * PI / 180.0f;
@@ -75,18 +75,22 @@ void handleInput(float dt) {
   playerX += manualSteerInput * 2.6f * dt;
 
   // Gentle auto-steer assist from the original implementation:
-  // follow road curvature, but reduce assist when the player is actively steering.
+  // follow road curvature, but reduce assist when the player is actively
+  // steering.
   int pSeg = findSegIdx(position + playerZdist);
   float curveMag = fabsf(segments[pSeg].curve);
   float curveNorm = clampF((curveMag - 2.0f) / 5.5f, 0.0f, 1.0f);
-  float autoTarget =
-      -segments[pSeg].curve * AUTO_STEER_TARGET_SCALE * (1.0f + 0.20f * curveNorm);
+  float autoTarget = -segments[pSeg].curve * AUTO_STEER_TARGET_SCALE *
+                     (1.0f + 0.20f * curveNorm);
   float speedAssist = clampF(speed / (maxSpeed * 0.45f), 0.0f, 1.0f);
-  float manualAssist = 1.0f - clampF(fabsf(manualSteerInput) * 1.25f, 0.0f, 1.0f);
+  float manualAssist =
+      1.0f - clampF(fabsf(manualSteerInput) * 1.25f, 0.0f, 1.0f);
   float centerAssist = 1.0f - clampF(fabsf(playerX) / 1.35f, 0.0f, 1.0f);
-  float assistGain = STEER_AUTO * AUTO_STEER_BLEND * (0.35f + centerAssist * 0.65f);
+  float assistGain =
+      STEER_AUTO * AUTO_STEER_BLEND * (0.35f + centerAssist * 0.65f);
   assistGain *= 1.0f + AUTO_STEER_CURVE_BOOST * curveNorm;
-  playerX += (autoTarget - playerX) * assistGain * speedAssist * manualAssist * dt;
+  playerX +=
+      (autoTarget - playerX) * assistGain * speedAssist * manualAssist * dt;
 
   // Light recentering to avoid long-term offset drift.
   playerX += (-playerX) * 0.18f * dt;
